@@ -299,6 +299,7 @@ async def async_request_openai_chat_completions(
         "stream": True,
         "stream_options": {
             "include_usage": True,
+            "continuous_usage_stats": True,
         },
     }
     _update_payload_common(payload, request_func_input)
@@ -316,7 +317,16 @@ async def async_request_openai_chat_completions(
     ttft = 0.0
     st = time.perf_counter()
     output.start_time = st
-    most_recent_timestamp = st
+    last_ts = st  # last observed chunk timestamp
+    last_completion = 0  # running completion_tokens counter from usage
+    saw_first_token = False
+
+    usage_itl: list[float] = []
+    chunk_itl: list[float] = []
+    saw_usage_delta = False
+    last_emit_ts = st  # last time we saw new tokens (usage-based)
+    last_chunk_ts = st  # last time we saw a content-bearing chunk
+
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
@@ -340,26 +350,49 @@ async def async_request_openai_chat_completions(
                             timestamp = time.perf_counter()
                             data = json.loads(chunk)
 
+                            # usage first: compute ITL from completion_tokens deltas
+                            usage = data.get("usage")
+                            if usage is not None:
+                                curr = usage.get("completion_tokens")
+                                if isinstance(curr, int):
+                                    delta = curr - last_completion
+                                    if delta > 0:
+                                        if not saw_first_token:
+                                            # set TTFT on first observed token(s)
+                                            if ttft == 0.0:
+                                                ttft = timestamp - st
+                                                output.ttft = ttft
+                                            # extra tokens in 1st emission have 0s ITL
+                                            if delta > 1:
+                                                usage_itl.extend([0.0] * (delta - 1))
+                                            saw_first_token = True
+                                            last_emit_ts = timestamp
+                                        else:
+                                            dt = timestamp - last_emit_ts
+                                            per_tok = dt / float(delta)
+                                            usage_itl.extend([per_tok] * delta)
+                                            last_emit_ts = timestamp
+                                        last_completion = curr
+                                        output.output_tokens = curr
+
+                            # choices after (text build; TTFT fallback if needed)
                             if choices := data.get("choices"):
                                 content = choices[0]["delta"].get("content")
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = timestamp - st
-                                    output.ttft = ttft
-
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
-
-                                generated_text += content or ""
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get("completion_tokens")
-
-                            most_recent_timestamp = timestamp
-
+                                if content is not None:
+                                    if ttft == 0.0:
+                                        ttft = timestamp - st
+                                        output.ttft = ttft
+                                    else:
+                                        # old per-chunk ITL proxy (seconds)
+                                        chunk_itl.append(timestamp - last_chunk_ts)
+                                    generated_text += content or ""
+                                last_ts = timestamp
+                # Prefer usage-based ITL if we saw post-first usage deltas;
+                # else fall back to chunk-based gaps.
+                output.itl = usage_itl if (saw_usage_delta and usage_itl) else chunk_itl
                 output.generated_text = generated_text
                 output.success = True
-                output.latency = most_recent_timestamp - st
+                output.latency = last_ts - st
             else:
                 output.error = response.reason or ""
                 output.success = False
